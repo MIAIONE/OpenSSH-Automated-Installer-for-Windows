@@ -44,9 +44,6 @@ function Initialize-Environment {
             $ExecutionContext.SessionState.LanguageMode = 'FullLanguage'
             [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
         }
-
-        # Initialize AMSI and memory protection
-        Initialize-SecurityContext
         
         return $true
     }
@@ -56,46 +53,92 @@ function Initialize-Environment {
     }
 }
 
-# Security context initialization
-function Initialize-SecurityContext {
+# Script initialization and privilege check
+function Initialize-ScriptEnvironment {
     [CmdletBinding()]
     param()
 
     try {
-        # AMSI handling code
-        $source = @"
-        using System;
-        using System.Runtime.InteropServices;
+        # Check if running as administrator
+        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        
+        if (-not $isAdmin) {
+            # Self-elevate the script with admin rights
+            $elevateOptions = @{
+                FilePath = "powershell.exe"
+                ArgumentList = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
+                Verb = "runas"
+                ErrorAction = "Stop"
+            }
 
-        public class SecurityHelper {
-            [DllImport("kernel32")]
-            public static extern IntPtr GetProcAddress(IntPtr hModule, string procedureName);
-            
-            [DllImport("kernel32")]
-            public static extern IntPtr LoadLibrary(string dllToLoad);
-            
-            [DllImport("kernel32")]
-            public static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
-            
-            public static void Initialize() {
-                try {
-                    uint oldProtect;
-                    VirtualProtect(Process.GetCurrentProcess().Handle, (UIntPtr)4, 0x40, out oldProtect);
-                } catch {}
+            try {
+                Start-Process @elevateOptions
+                exit
+            }
+            catch {
+                # Fallback elevation method using different techniques
+                $elevationMethods = @(
+                    {
+                        # Method 1: Using ShellExecute
+                        $shellApp = New-Object -ComObject Shell.Application
+                        $shellApp.ShellExecute("powershell.exe", 
+                            "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`"", 
+                            "", "runas")
+                    },
+                    {
+                        # Method 2: Using scheduled task
+                        $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+                            -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
+                        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date)
+                        $principal = New-ScheduledTaskPrincipal -UserId (Get-CimInstance -ClassName Win32_ComputerSystem).UserName -RunLevel Highest
+                        $task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal
+                        Register-ScheduledTask -TaskName "OpenSSHInstaller" -InputObject $task -Force
+                        Start-ScheduledTask -TaskName "OpenSSHInstaller"
+                        Unregister-ScheduledTask -TaskName "OpenSSHInstaller" -Confirm:$false
+                    }
+                )
+
+                foreach ($method in $elevationMethods) {
+                    try {
+                        & $method
+                        exit
+                    }
+                    catch {
+                        Write-Warning "Elevation method failed: $_"
+                        continue
+                    }
+                }
+
+                throw "Failed to elevate privileges using all available methods"
             }
         }
-"@
-        Add-Type -TypeDefinition $source -Language CSharp
-        [SecurityHelper]::Initialize()
 
-        # Set process-level security
-        $null = [System.Runtime.CompilerServices.RuntimeHelpers]::PrepareConstrainedRegions()
-        
-        Write-Log "Security context initialized successfully" -Level "SUCCESS"
+        # Set strict mode and error handling
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        $WarningPreference = 'Continue'
+        $VerbosePreference = 'Continue'
+
+        # Configure execution policy
+        try {
+            Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+        }
+        catch {
+            Write-Warning "Unable to set execution policy: $_"
+        }
+
+        # Set PowerShell encoding
+        $OutputEncoding = [System.Text.Encoding]::UTF8
+        [System.Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        [System.Console]::InputEncoding = [System.Text.Encoding]::UTF8
+
+        # Configure security protocol
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
         return $true
     }
     catch {
-        Write-Log "Security context initialization warning (non-critical): $_" -Level "WARNING"
+        Write-Error "Failed to initialize script environment: $_"
         return $false
     }
 }
@@ -145,6 +188,13 @@ function Install-OpenSSHWithFallback {
     param()
     
     try {
+        # 使用脚本范围的变量来跟踪执行状态
+        if ($script:InstallationInProgress) {
+            Write-Log "Installation already in progress, skipping..." -Level "INFO"
+            return $true
+        }
+        $script:InstallationInProgress = $true
+
         # Initialize environment
         if (-not (Initialize-Environment)) {
             throw "Environment initialization failed"
@@ -164,12 +214,6 @@ function Install-OpenSSHWithFallback {
             throw "Installation failed: $($installResult.Message)"
         }
 
-        # Post-installation configuration
-        $configResult = Set-OpenSSHConfiguration
-        if (-not $configResult.Success) {
-            Write-Log "Warning: Some post-installation configuration failed" -Level "WARNING"
-        }
-
         Write-Log "OpenSSH installation completed successfully" -Level "SUCCESS"
         return $true
     }
@@ -179,6 +223,7 @@ function Install-OpenSSHWithFallback {
         return $false
     }
     finally {
+        $script:InstallationInProgress = $false
         Write-Log "Installation process finished. Log file: $($script:Config.LogFile)" -Level "INFO"
     }
 }
@@ -194,106 +239,24 @@ $ErrorActionPreference = 'Stop'
 # Add comprehensive AMSI handling
 function Initialize-SafeExecutionContext {
     try {
-        # Attempt to work around AMSI issues
-        $source = @"
-using System;
-using System.Runtime.InteropServices;
-
-public class AmsiHelper {
-    [DllImport("kernel32")]
-    public static extern IntPtr GetProcAddress(IntPtr hModule, string procedureName);
-    
-    [DllImport("kernel32")]
-    public static extern IntPtr LoadLibrary(string dllToLoad);
-    
-    [DllImport("kernel32")]
-    public static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
-    
-    public static void Patch() {
-        try {
-            string dll = "a" + "ms" + "i.dll";
-            IntPtr lib = LoadLibrary(dll);
-            IntPtr addr = GetProcAddress(lib, "AmsiScanBuffer");
-            
-            if (addr != IntPtr.Zero) {
-                uint oldProtect;
-                VirtualProtect(addr, (UIntPtr)4, 0x40, out oldProtect);
-                
-                byte[] patch = new byte[] { 0x31, 0xC0, 0xC3 };
-                Marshal.Copy(patch, 0, addr, patch.Length);
-                
-                VirtualProtect(addr, (UIntPtr)4, oldProtect, out oldProtect);
-            }
-        }
-        catch {}
-    }
-}
-"@
-        Add-Type -TypeDefinition $source -Language CSharp
-        [AmsiHelper]::Patch()
-        
-        # Set execution policy for current process
-        $ctx = $ExecutionContext.GetType().GetField("_context","NonPublic,Instance").GetValue($ExecutionContext)
-        $ctx.GetType().GetField("_authorizationManager","NonPublic,Instance").SetValue($ctx, (New-Object System.Management.Automation.AuthorizationManager "Microsoft.PowerShell"))
-        
-    }
-    catch {
-        Write-Log "Safe execution context initialization warning (non-critical): $($_.Exception.Message)" -Level "WARNING"
-    }
-    
-    # Additional safety measures
-    try {
+        # 基本的执行策略和安全协议设置
         $env:PSExecutionPolicyPreference = 'Bypass'
         [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+        # 只在确实需要时才设置更多安全参数
+        if ($PSVersionTable.PSVersion.Major -le 5) {
+            $ctx = $ExecutionContext.GetType().GetField("_context","NonPublic,Instance").GetValue($ExecutionContext)
+            $ctx.GetType().GetField("_authorizationManager","NonPublic,Instance").SetValue($ctx, 
+                (New-Object System.Management.Automation.AuthorizationManager "Microsoft.PowerShell"))
+        }
     }
     catch {
-        Write-Log "Additional safety measures warning (non-critical): $($_.Exception.Message)" -Level "WARNING"
+        Write-Log "Execution context initialization warning (non-critical): $_" -Level "WARNING"
     }
 }
 
 # Call initialization before any other code
 Initialize-SafeExecutionContext
-
-# AMSI and Security Setup
-function Initialize-ScriptSecurity {
-    try {
-        # Try to set memory protection
-        $MethodDefinition = @"
-            using System;
-            using System.Runtime.InteropServices;
-            
-            public class MemoryProtection {
-                [DllImport("kernel32.dll")]
-                public static extern bool SetProcessDEPPolicy(uint dwFlags);
-                
-                public static void EnableDEP() {
-                    try {
-                        SetProcessDEPPolicy(0x00000001);
-                    } catch {
-                        // Ignore if already set
-                    }
-                }
-            }
-"@
-        Add-Type -TypeDefinition $MethodDefinition -ErrorAction SilentlyContinue
-        [MemoryProtection]::EnableDEP()
-    }
-    catch {
-        Write-Warning "Unable to set enhanced memory protection. Continuing with default settings."
-    }
-
-    # Handle AMSI if needed
-    try {
-        # Set AMSI timeout to prevent hangs
-        $env:POWERSHELL_AMSI_TIMEOUT = '1'
-    }
-    catch {
-        Write-Warning "AMSI context initialization failed. Continuing with limited scanning."
-    }
-}
-
-# Call security initialization
-Initialize-ScriptSecurity
 
 # Create fallback execution context if needed
 $ExecutionContext.SessionState.LanguageMode = 'FullLanguage'
@@ -973,24 +936,38 @@ function Install-OpenSSH {
     }
 }
 
+
+
 # Main execution
-try {
-    $installResult = Install-OpenSSH -Verbose
-    if ($installResult.Success) {
-        Write-Log "OpenSSH installation process completed successfully" -Level "SUCCESS"
-    } else {
-        Write-Log "OpenSSH installation process failed: $($installResult.Message)" -Level "ERROR"
+
+# Global error handler
+$Global:ErrorActionPreference = 'Stop'
+$Global:Error.Clear()
+
+# Register global error handler
+$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+    if ($Global:Error.Count -gt 0) {
+        Write-Warning "Script terminated with errors. Check the error log for details."
     }
 }
-catch {
-    Write-Log "Critical error in main execution: $($_.Exception.Message)" -Level "ERROR"
-    Write-Log $_.Exception.StackTrace -Level "ERROR"
-}
-finally {
-    Write-Log "Script execution completed. Log file: $LogFile" -Level "INFO"
+
+# Global exception handler
+$Global:PSDefaultParameterValues = @{
+    '*:ErrorAction' = 'Stop'
+    '*:WarningAction' = 'Continue'
 }
 
-# Script entry point
+trap {
+    Write-Error "Critical error occurred: $_"
+    Write-Error $_.ScriptStackTrace
+    exit 1
+}
+
+# Initialize script environment
+if (-not (Initialize-ScriptEnvironment)) {
+    exit 1
+}
+
 if ($MyInvocation.InvocationName -ne '.') {
     try {
         # Validate execution environment
@@ -1002,9 +979,14 @@ if ($MyInvocation.InvocationName -ne '.') {
             throw "PowerShell version $($script:MinimumPSVersion) or higher is required"
         }
 
-        # Execute installation
+        # Execute installation only once
         $result = Install-OpenSSHWithFallback
-        exit $(if ($result) { 0 } else { 1 })
+        if ($result) {
+            exit 0
+        }
+        else {
+            exit 1
+        }
     }
     catch {
         Write-Error $_
