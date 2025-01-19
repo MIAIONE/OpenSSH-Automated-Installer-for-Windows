@@ -3,9 +3,23 @@
 [CmdletBinding()]
 param(
     [switch]$Remote,
-    [string]$LogDirectory = (Join-Path $PSScriptRoot "logs"),
+    [string]$LogDirectory = $null,
     [switch]$Force
 )
+
+# Script root and path initialization
+$script:ScriptRoot = $PSScriptRoot
+if (-not $script:ScriptRoot) {
+    $script:ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
+}
+if (-not $script:ScriptRoot) {
+    $script:ScriptRoot = (Get-Location).Path
+}
+
+# Set default log directory if not provided
+if (-not $LogDirectory) {
+    $LogDirectory = Join-Path $script:ScriptRoot "logs"
+}
 
 # Script metadata
 $script:ScriptVersion = "2.0.0"
